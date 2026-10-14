@@ -380,6 +380,16 @@ class CpuPlatform(Platform):
             and "-gelu_and_mul" not in compilation_config.custom_ops
         ):
             compilation_config.custom_ops.append("+gelu_and_mul")
+        # With DP the fused-MoE layer stays an opaque custom op, so a disabled
+        # SiluAndMul inside it (shared experts) runs as a separately compiled
+        # function whose per-call dispatch (~85us) dwarfs the C++ kernel.
+        if (
+            cls.get_cpu_architecture() == CpuArchEnum.X86
+            and vllm_config.parallel_config.data_parallel_size > 1
+            and "+silu_and_mul" not in compilation_config.custom_ops
+            and "-silu_and_mul" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+silu_and_mul")
 
         vllm_config.profiler_config.torch_profiler_dump_cuda_time_total = False
 

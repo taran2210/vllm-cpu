@@ -1337,8 +1337,9 @@ class FusedMoEConfig:
         from vllm._aiter_ops import rocm_aiter_ops
 
         tp_size = self.moe_parallel_config.tp_size
-        assert self.intermediate_size % tp_size == 0
-        self.intermediate_size_per_partition = self.intermediate_size // tp_size
+        # An uneven split (e.g. TP x DP without EP) leaves the last ranks short;
+        # the quant method has to pad the TP shards, which RoutedExperts checks.
+        self.intermediate_size_per_partition = cdiv(self.intermediate_size, tp_size)
 
         if self.dp_size > 1:
             logger.debug_once(

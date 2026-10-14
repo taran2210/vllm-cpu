@@ -4,6 +4,8 @@
 // clang-format off
 
 #pragma once
+#include <cstring>
+
 #include "vec.h"
 
 template <typename scalar_t>
@@ -72,15 +74,26 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const input_t* __restrict_
   }
 }
 
-// acc from [topk, K] to [K]
+// acc from [topk, K] to [K], rows are pre-multiplied by `weights`
+//   zero-weight rows are skipped: with expert parallel, entries routed to
+//   experts on other ranks get zero weight and their rows are never written
 template <typename scalar_t>
-inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
+inline void sum_stub(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const float* __restrict__ weights,
+    int64_t topk,
+    int64_t K) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   if (topk == 1) {
     // do copy for topk = 1
-    copy_stub(out, input, K);
+    if (weights[0] != 0.f) {
+      copy_stub(out, input, K);
+    } else {
+      std::memset(out, 0, K * sizeof(scalar_t));
+    }
   } else {
     // do sum for topk != 1
     int64_t d;
@@ -89,9 +102,11 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
       fVec sum_fvec0 = fVec(0.f);
       fVec sum_fvec1 = fVec(0.f);
       for (int t = 0; t < topk; ++t) {
-        auto [x_fvec0, x_fvec1] = load_float_vec2(input + t * K + d);
-        sum_fvec0 += x_fvec0;
-        sum_fvec1 += x_fvec1;
+        if (weights[t] != 0.f) {
+          auto [x_fvec0, x_fvec1] = load_float_vec2(input + t * K + d);
+          sum_fvec0 += x_fvec0;
+          sum_fvec1 += x_fvec1;
+        }
       }
       bVec out_bvec = convert_from_float_ext<scalar_t>(sum_fvec0, sum_fvec1);
       out_bvec.store(out + d);
@@ -99,7 +114,9 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
     for (; d < K; ++d) {
       float sum_val = 0.f;
       for (int t = 0; t < topk; ++t) {
-        sum_val += static_cast<float>(input[t * K + d]);
+        if (weights[t] != 0.f) {
+          sum_val += static_cast<float>(input[t * K + d]);
+        }
       }
       out[d] = static_cast<scalar_t>(sum_val);
     }

@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
@@ -45,6 +46,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticGroupScale,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -131,6 +133,50 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
     def _packed_dim(self, dim: int) -> int:
         return math.ceil(dim * self.num_bits / 32)
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = super().maybe_roundup_sizes(
+            hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config
+        )
+        # Pad each TP shard to whole scale groups when they don't split evenly,
+        # e.g. TP x DP without EP: 512 // 128 = 4 groups over 6 ranks gives
+        # ranks 0-3 one group each and ranks 4-5 an all-padding shard.
+        if (
+            self.wna16_backend == WNA16MoEBackend.CPU
+            and self.strategy == "group"
+            and moe_parallel_config.tp_size > 1
+            and moe_parallel_config.ep_size == 1
+            and intermediate_size_per_partition % self.group_size != 0
+            and self.moe.intermediate_size % self.group_size == 0
+            and self.symmetric
+            and not self.weight_quant.actorder
+            and not self.moe.has_bias
+        ):
+            self.moe.tp_shard_with_padding = True
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, self.group_size
+            )
+        return hidden_size, intermediate_size_per_partition
+
+    def _zero_padded_scales(self, layer: torch.nn.Module) -> None:
+        # The padded loader fills missing shard rows with zero weights and unit
+        # scales, but packed uint4b8 zeros decode to -8, so zero the scales of
+        # the padded rows and groups to make them contribute nothing.
+        shard = self.moe.intermediate_size_per_partition
+        valid = self.moe.intermediate_size - self.moe.tp_rank * shard
+        valid = min(max(valid, 0), shard)
+        if valid == shard:
+            return
+        w13_scale = layer.w13_weight_scale.data
+        for i in range(2 if self.moe.is_act_and_mul else 1):
+            w13_scale[:, i * shard + valid : (i + 1) * shard] = 0
+        layer.w2_weight_scale.data[:, :, valid // self.group_size :] = 0
 
     def get_weight_shape(
         self,
@@ -380,6 +426,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             swigluoai_w13_interleave_perm,
         )
+
+        if self.moe.tp_shard_with_padding:
+            self._zero_padded_scales(layer)
 
         # Reorder before the conversion below, which repacks w13 for the kernel.
         # The CT WNA16 buffers are N-first, so 2I is dim 1 of the packed weight

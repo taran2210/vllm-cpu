@@ -980,6 +980,77 @@ def test_int4_w4a16_cpu_fused_moe(M, N, K, E, topk, group_size, quant_algo, seed
     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("M", [1, 64])
+@pytest.mark.parametrize("N,K,E,topk,group_size", INT4_MOE_CONFIGS[2:])
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_int4_w4a16_cpu_fused_moe_expert_parallel(
+    M, N, K, E, topk, group_size, ep_size
+):
+    """Each EP rank only computes its local experts (ids remapped through
+    expert_map, -1 for remote experts); the sum over ranks must match the
+    unsharded MoE. M=1 also leaves some ranks with no local tokens."""
+    set_random_seed(0)
+    quant_algo = ops.CPUQuantAlgo.GPTQ
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / (0.5 * K**0.5)
+    (w1_int4, w2_int4, w1_packed, w2_packed, _, _, w1_zp, w2_zp, w1_s, w2_s) = (
+        _make_int4_moe_weights(E, N, K, group_size, quant_algo)
+    )
+    score = torch.softmax(torch.randn(M, E), dim=-1)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+
+    ref_out = _ref_int4_moe(
+        a, w1_int4, w2_int4, None, None, w1_s, w2_s, topk_weight, topk_ids, group_size
+    )
+
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        prepare_int4_moe_layer_for_cpu,
+    )
+
+    blocked = prepare_int4_moe_layer_for_cpu(
+        w1_packed,
+        w2_packed,
+        w1_s,
+        w2_s,
+        quant_algo=quant_algo,
+        w13_zeros=w1_zp,
+        w2_zeros=w2_zp,
+    )
+    (blocked_w1, blocked_w2, blocked_s1, blocked_s2, blocked_z1, blocked_z2) = blocked
+
+    local_E = E // ep_size
+    out = torch.zeros(M, K, dtype=torch.float32)
+    for rank in range(ep_size):
+        experts = slice(rank * local_E, (rank + 1) * local_E)
+        expert_map = torch.full((E,), -1, dtype=torch.int32)
+        expert_map[experts] = torch.arange(local_E, dtype=torch.int32)
+
+        rank_out = torch.empty_like(a)
+        ops.fused_experts_cpu(
+            rank_out,
+            a.clone(),
+            blocked_w1[experts].contiguous(),
+            blocked_w2[experts].contiguous(),
+            topk_weight,
+            expert_map[topk_ids],
+            ops.CPUQuantMethod.INT4_W4A8,
+            blocked_s1[experts].contiguous(),
+            blocked_s2[experts].contiguous(),
+            blocked_z1[experts].contiguous(),
+            blocked_z2[experts].contiguous(),
+            None,  # block_size
+            None,  # w1_bias
+            None,  # w2_bias
+            None,  # alpha
+            None,  # limit
+            True,  # is_vnni
+        )
+        out += rank_out.float()
+
+    torch.testing.assert_close(ref_out.bfloat16(), out.bfloat16(), atol=1e-2, rtol=1e-2)
+
+
 # ===========================================================================
 # INT8 W8A8 MoE
 # ===========================================================================

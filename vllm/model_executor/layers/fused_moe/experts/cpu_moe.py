@@ -888,7 +888,7 @@ class CPUExpertsInt4(mk.FusedMoEExpertsModular):
         return True
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def moe_problem_size(
         self,
@@ -951,6 +951,11 @@ class CPUExpertsInt4(mk.FusedMoEExpertsModular):
                 "CPUExpertsInt4 (W4A16) does not support "
                 "apply_router_weight_on_input=True. "
             )
+
+        if expert_map is not None:
+            # Global -> local expert ids; experts owned by other EP ranks map
+            # to -1 and are skipped by fused_experts_cpu.
+            topk_ids = expert_map[topk_ids]
 
         fused_experts_cpu(
             output,

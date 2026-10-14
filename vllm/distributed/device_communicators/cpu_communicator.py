@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
+import socket
 from typing import Any
 
 import torch
@@ -31,6 +33,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         self.dist_module = torch.distributed
 
+        # dp/ep carry the MoE dispatch/combine traffic under data parallel
+        use_shm_group = unique_name.startswith(("tp", "pp", "dp", "ep"))
+        shm_group_name = None
         if (
             (
                 current_platform.get_cpu_architecture() == CpuArchEnum.X86
@@ -39,14 +44,15 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 or current_platform.get_cpu_architecture() == CpuArchEnum.S390X
             )
             and hasattr(torch.ops._C, "init_shm_manager")
-            and (unique_name.startswith("tp") or unique_name.startswith("pp"))
-            and self._all_group_ranks_share_shm_group_name()
+            and use_shm_group
         ):
-            self.dist_module = _CPUSHMDistributed(self)
-        elif unique_name.startswith("tp") or unique_name.startswith("pp"):
+            shm_group_name = self._agree_on_shm_group_name()
+        if shm_group_name is not None:
+            self.dist_module = _CPUSHMDistributed(self, shm_group_name)
+        elif use_shm_group:
             logger.info(
-                "CPU SHM communicator disabled for group %s: ranks do not share "
-                "the same SHM group name, falling back to torch.distributed.",
+                "CPU SHM communicator disabled for group %s: ranks are not on "
+                "the same host, falling back to torch.distributed.",
                 unique_name,
             )
 
@@ -68,21 +74,31 @@ class CpuCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             logger.info("Using allgather_reducescatter all2all manager.")
 
-    def _all_group_ranks_share_shm_group_name(self) -> bool:
-        """CPUSHM requires all ranks in this group to agree on one SHM group name.
-        This is a lightweight consistency check for VLLM_DIST_IDENT/name inputs.
+    def _agree_on_shm_group_name(self) -> str | None:
+        """CPUSHM requires all ranks in this group to be on one host and to agree
+        on one SHM group name. Groups spanning DP engines (e.g. dp/ep) derive
+        different names from their engine-local VLLM_DIST_IDENT, so every rank
+        adopts the group leader's name. Returns None if ranks span hosts.
         """
-        local_name = _CPUSHMDistributed.make_group_name(self)
-        names: list[str] = [""] * self.world_size
+        local = (_CPUSHMDistributed.make_group_name(self), socket.gethostname())
+        gathered: list[tuple[str, str]] = [("", "")] * self.world_size
         torch.distributed.all_gather_object(
-            names,
-            local_name,
+            gathered,
+            local,
             group=self.device_group,
         )
-        return len(set(names)) == 1
+        if len({host for _, host in gathered}) != 1:
+            return None
+        return gathered[0][0]
+
+    def _dist_module_for(self, input_: torch.Tensor) -> Any:
+        # SHM collectives only dispatch floating types.
+        if input_.is_floating_point():
+            return self.dist_module
+        return torch.distributed
 
     def all_reduce(self, input_):
-        self.dist_module.all_reduce(input_, group=self.device_group)
+        self._dist_module_for(input_).all_reduce(input_, group=self.device_group)
         return input_
 
     def gather(
@@ -131,7 +147,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        self.dist_module.all_gather_into_tensor(
+        self._dist_module_for(input_).all_gather_into_tensor(
             output_tensor, input_, group=self.device_group
         )
 
@@ -144,6 +160,124 @@ class CpuCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def _all_gather_dim0(self, input_: torch.Tensor) -> torch.Tensor:
+        input_ = input_.contiguous()
+        if input_.numel() == 0:
+            return input_.new_empty((0,) + input_.shape[1:])
+        return self.all_gather(input_, dim=0)
+
+    def _all_gatherv_padded(
+        self, input_: torch.Tensor, sizes: list[int] | None
+    ) -> torch.Tensor:
+        if sizes is None or all(s == sizes[0] for s in sizes):
+            return self._all_gather_dim0(input_)
+        # Pad every rank to the largest size, gather, then drop padding.
+        assert input_.shape[0] == sizes[self.rank_in_group]
+        max_size = max(sizes)
+        padded = input_.new_empty((max_size,) + input_.shape[1:])
+        padded[: input_.shape[0]].copy_(input_)
+        gathered = self._all_gather_dim0(padded)
+        return torch.cat(
+            [gathered[r * max_size : r * max_size + s] for r, s in enumerate(sizes)]
+        )
+
+    def all_gatherv(
+        self,
+        input_: torch.Tensor | list[torch.Tensor],
+        dim: int = 0,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        if dim != 0:
+            raise NotImplementedError("only dim 0 all-gatherv is supported")
+        assert sizes is None or len(sizes) == self.world_size
+        inputs = [input_] if isinstance(input_, torch.Tensor) else list(input_)
+        if isinstance(self.dist_module, _CPUSHMDistributed):
+            if sizes is None:
+                sizes = [inputs[0].shape[0]] * self.world_size
+            # One SHM round for all tensors (any dtype), copied straight into
+            # each rank's rows: uneven sizes need no padding or concatenation.
+            inputs = [t.contiguous() for t in inputs]
+            outputs = [t.new_empty((sum(sizes),) + t.shape[1:]) for t in inputs]
+            self.dist_module.all_gatherv(inputs, outputs, sizes)
+        else:
+            outputs = [self._all_gatherv_padded(t, sizes) for t in inputs]
+        return outputs[0] if isinstance(input_, torch.Tensor) else outputs
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        return self.reduce_scatterv(input_, dim=dim, sizes=None)
+
+    def reduce_scatterv(
+        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+    ) -> torch.Tensor:
+        return self._reduce_scatterv(input_, dim, sizes)
+
+    def reduce_scatterv_into_output(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        return self._reduce_scatterv(input_, dim, sizes, output)
+
+    def _reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        dim: int,
+        sizes: list[int] | None,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            if output is None:
+                return input_
+            return output.copy_(input_)
+        if dim < 0:
+            dim += input_.dim()
+        input_tensor = input_ if dim == 0 else input_.movedim(0, dim)
+        if sizes is None:
+            assert input_tensor.shape[0] % self.world_size == 0
+            sizes = [input_tensor.shape[0] // self.world_size] * self.world_size
+        assert len(sizes) == self.world_size
+        assert input_tensor.shape[0] == sum(sizes)
+        start = sum(sizes[: self.rank_in_group])
+        size = sizes[self.rank_in_group]
+        result_shape = (size,) + input_tensor.shape[1:]
+        if isinstance(self.dist_module, _CPUSHMDistributed) and (
+            input_tensor.is_floating_point()
+        ):
+            input_tensor = input_tensor.contiguous()
+            # Reduce straight into the caller's buffer when it is laid out
+            # like this rank's slice (the MoE combine output).
+            in_place = (
+                output is not None
+                and dim == 0
+                and output.is_contiguous()
+                and output.shape == result_shape
+                and output.dtype == input_tensor.dtype
+            )
+            result = output if in_place else input_tensor.new_empty(result_shape)
+            # Equal slices let the op derive the offset from the rank, which
+            # keeps shape-derived ints out of compiled graphs (TP sequence
+            # parallel calls this from inside the model's graph).
+            out_offset = (
+                None
+                if all(s == sizes[0] for s in sizes)
+                else start * math.prod(input_tensor.shape[1:])
+            )
+            self.dist_module.reduce_scatter(result, input_tensor, out_offset)
+            if in_place:
+                return output
+        else:
+            # gloo has no variable-size reduce-scatter: all-reduce a private
+            # copy, then keep this rank's chunk.
+            input_tensor = input_tensor.clone(memory_format=torch.contiguous_format)
+            self.all_reduce(input_tensor)
+            result = input_tensor[start : start + size]
+        result = result.movedim(0, dim).contiguous()
+        if output is None:
+            return result
+        return output.copy_(result)
 
     def send_tensor_dict(
         self,
@@ -224,12 +358,23 @@ class CpuCommunicator(DeviceCommunicatorBase):
             is_sequence_parallel,
         )
 
+    def combine_into_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        assert self.all2all_manager is not None
+        return self.all2all_manager.combine_into_output(
+            hidden_states, output, is_sequence_parallel
+        )
+
 
 class _CPUSHMDistributed:
-    def __init__(self, communicator: CpuCommunicator):
+    def __init__(self, communicator: CpuCommunicator, group_name: str):
         self.communicator = communicator
 
-        self.group_name = self.make_group_name(communicator)
+        self.group_name = group_name
 
         self.handle = self._init_cpu_shm()
 
@@ -296,6 +441,21 @@ class _CPUSHMDistributed:
         group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
+
+    def all_gatherv(
+        self,
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        sizes: list[int],
+    ) -> None:
+        torch.ops._C.shm_all_gatherv(self.handle, inputs, outputs, sizes)
+
+    def reduce_scatter(
+        self, output: torch.Tensor, input: torch.Tensor, out_offset: int | None
+    ) -> None:
+        # out_offset: element offset of this rank's slice in input, None for
+        # equal slices ordered by rank
+        torch.ops._C.shm_reduce_scatter(self.handle, input, output, out_offset)
 
     def send_tensor_dict(
         self,

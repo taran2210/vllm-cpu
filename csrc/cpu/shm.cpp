@@ -1,5 +1,6 @@
 #include "cpu/cpu_types.hpp"
 
+#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -16,6 +17,9 @@ static_assert(PER_THREAD_SHM_BUFFER_BYTES % 2 == 0);
 #define PER_THREAD_SHM_BUFFER_OFFSET (PER_THREAD_SHM_BUFFER_BYTES >> 1)
 #define MIN_THREAD_PROCESS_SIZE (256)
 #define MAX_P2P_SEND_TENSOR_NUM 8
+#define RS_BLOCK_BYTES (4 * 1024)
+#define RS_BLOCKED_MIN_BYTES_X_RANKS (128LL * 1024 * 1024)
+static_assert((PER_THREAD_SHM_BUFFER_BYTES >> 1) % RS_BLOCK_BYTES == 0);
 
 template <typename scalar_t>
 struct KernelVecType {
@@ -543,6 +547,196 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
 
   return;
 }
+
+// Same protocol as all_reduce_sum_impl, but each rank only reduces its own
+// slice [out_begin, out_end) of `data` and writes it to `output`. Each thread
+// takes one contiguous range, matching how the producing kernel usually split
+// `data`, so threads read what is still in their own cache. Only the threads
+// whose range overlaps this rank's slice reduce, which costs little with two
+// ranks. Ranges entirely inside this rank's slice are never read remotely and
+// are not copied to SHM.
+template <typename scalar_t, int RANKS>
+void reduce_scatter_sum_contiguous_impl(ThreadSHMContext* ctx, scalar_t* data,
+                                        size_t elem_num, scalar_t* output,
+                                        int64_t out_begin, int64_t out_end) {
+  CPU_KERNEL_GUARD_IN(reduce_scatter_sum_contiguous_impl)
+  using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
+  constexpr int64_t vec_elem_num = vec_t::get_elem_num();
+
+  shm_cc_ops::shm_cc_loop<scalar_t>(
+      ctx, elem_num,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num, bool fast_mode) {
+        int rank = thread_ctx->rank;
+        scalar_t* thread_shm_ptr =
+            thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
+        scalar_t* thread_data_ptr = data + data_offset;
+
+        scalar_t* remote_data_ptrs[RANKS - 1];
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          remote_data_ptrs[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(
+              thread_ctx->get_swizzled_rank(idx + 1));
+        });
+
+        if (!fast_mode) {
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+        }
+
+        if (data_offset < out_begin || data_offset + data_elem_num > out_end) {
+          shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_data_ptr,
+                                    data_elem_num * sizeof(scalar_t));
+        }
+        thread_ctx->commit_ready_stamp();
+
+        // part of this chunk that belongs to this rank's output, may start
+        // at any element so use unaligned loads
+        const int64_t begin = std::max(data_offset, out_begin) - data_offset;
+        const int64_t end =
+            std::min(data_offset + data_elem_num, out_end) - data_offset;
+        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+        if (begin >= end) {
+          return;
+        }
+
+        scalar_t* out_ptr = output + (data_offset + begin - out_begin);
+        int64_t i = begin;
+        for (; i + vec_elem_num <= end; i += vec_elem_num) {
+          vec_t local_data(thread_data_ptr + i);
+          vec_op::FP32Vec16 acc(local_data);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t remote_data(remote_data_ptrs[idx] + i);
+            acc = acc + vec_op::FP32Vec16(remote_data);
+          });
+          vec_t(acc).save(out_ptr + (i - begin));
+        }
+        for (; i < end; ++i) {
+          float acc = static_cast<float>(thread_data_ptr[i]);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            acc += static_cast<float>(remote_data_ptrs[idx][i]);
+          });
+          out_ptr[i - begin] = static_cast<scalar_t>(acc);
+        }
+      });
+}
+
+// Same as reduce_scatter_sum_contiguous_impl, but elements are dealt to
+// threads in RS_BLOCK_BYTES blocks round-robin, so every rank's slice is
+// spread over all threads instead of the 1/RANKS of threads whose range
+// overlaps it. All ranks see the same elem_num, so they agree on the block
+// layout without knowing each other's slices.
+template <typename scalar_t, int RANKS>
+void reduce_scatter_sum_blocked_impl(ThreadSHMContext* ctx, scalar_t* data,
+                                     size_t elem_num, scalar_t* output,
+                                     int64_t out_begin, int64_t out_end) {
+  CPU_KERNEL_GUARD_IN(reduce_scatter_sum_blocked_impl)
+  using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
+  constexpr int64_t vec_elem_num = vec_t::get_elem_num();
+  constexpr int64_t block_elem_num = RS_BLOCK_BYTES / sizeof(scalar_t);
+  constexpr int64_t round_block_capacity =
+      (PER_THREAD_SHM_BUFFER_BYTES >> 1) / RS_BLOCK_BYTES;
+  static_assert(block_elem_num % vec_elem_num == 0);
+  const int thread_num = ctx->thread_num;
+  const int64_t total = elem_num;
+  const int64_t block_num = (total + block_elem_num - 1) / block_elem_num;
+
+#pragma omp parallel for schedule(static, 1)
+  for (int t = 0; t < thread_num; ++t) {
+    ThreadSHMContext* thread_ctx = ctx + t;
+    // this thread owns global blocks t, t + thread_num, t + 2 * thread_num...
+    const int64_t thread_block_num =
+        block_num > t ? (block_num - t + thread_num - 1) / thread_num : 0;
+    const bool fast_mode = thread_block_num <= round_block_capacity;
+
+    for (int64_t round_begin = 0; round_begin < thread_block_num;
+         round_begin += round_block_capacity) {
+      const int64_t round_block_num =
+          std::min(round_block_capacity, thread_block_num - round_begin);
+      scalar_t* local_shm =
+          thread_ctx->get_thread_shm_ptr<scalar_t>(thread_ctx->rank);
+      scalar_t* remote_shm[RANKS - 1];
+      vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+        remote_shm[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(
+            thread_ctx->get_swizzled_rank(idx + 1));
+      });
+
+      if (!fast_mode) {
+        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+      }
+
+      for (int64_t b = 0; b < round_block_num; ++b) {
+        const int64_t begin =
+            ((round_begin + b) * thread_num + t) * block_elem_num;
+        const int64_t end = std::min(begin + block_elem_num, total);
+        if (begin >= out_begin && end <= out_end) {
+          continue;
+        }
+        const int64_t bytes = (end - begin) * sizeof(scalar_t);
+        const int64_t aligned_bytes = (bytes >> 6) << 6;
+        scalar_t* dst = local_shm + b * block_elem_num;
+        shm_cc_ops::memcpy_to_shm(dst, data + begin, aligned_bytes);
+        if (aligned_bytes < bytes) {
+          std::memcpy(reinterpret_cast<int8_t*>(dst) + aligned_bytes,
+                      reinterpret_cast<int8_t*>(data + begin) + aligned_bytes,
+                      bytes - aligned_bytes);
+        }
+      }
+      thread_ctx->commit_ready_stamp();
+      thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+      for (int64_t b = 0; b < round_block_num; ++b) {
+        const int64_t begin =
+            ((round_begin + b) * thread_num + t) * block_elem_num;
+        const int64_t lo = std::max(begin, out_begin);
+        const int64_t hi = std::min({begin + block_elem_num, total, out_end});
+        if (lo >= hi) {
+          continue;
+        }
+        // the slice may start at any element, so use unaligned loads
+        const int64_t shm_off = b * block_elem_num + (lo - begin);
+        const scalar_t* local_ptr = data + lo;
+        scalar_t* out_ptr = output + (lo - out_begin);
+        const int64_t len = hi - lo;
+        int64_t i = 0;
+        for (; i + vec_elem_num <= len; i += vec_elem_num) {
+          vec_t local_data(local_ptr + i);
+          vec_op::FP32Vec16 acc(local_data);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t remote_data(remote_shm[idx] + shm_off + i);
+            acc = acc + vec_op::FP32Vec16(remote_data);
+          });
+          vec_t(acc).save(out_ptr + i);
+        }
+        for (; i < len; ++i) {
+          float acc = static_cast<float>(local_ptr[i]);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            acc += static_cast<float>(remote_shm[idx][shm_off + i]);
+          });
+          out_ptr[i] = static_cast<scalar_t>(acc);
+        }
+      }
+
+      thread_ctx->next_stamp();
+      thread_ctx->next_buffer();
+    }
+  }
+}
+
+// Round-robin blocks balance the reduction over all threads but give up the
+// producer's cache locality, which only pays off for large inputs spread over
+// many ranks (measured crossover: ~21 MB at 6 ranks, ~32 MB at 4 ranks).
+template <typename scalar_t, int RANKS>
+void reduce_scatter_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
+                             size_t elem_num, scalar_t* output,
+                             int64_t out_begin, int64_t out_end) {
+  if (RANKS >= 3 && static_cast<int64_t>(elem_num * sizeof(scalar_t)) * RANKS >=
+                        RS_BLOCKED_MIN_BYTES_X_RANKS) {
+    reduce_scatter_sum_blocked_impl<scalar_t, RANKS>(
+        ctx, data, elem_num, output, out_begin, out_end);
+  } else {
+    reduce_scatter_sum_contiguous_impl<scalar_t, RANKS>(
+        ctx, data, elem_num, output, out_begin, out_end);
+  }
+}
 };  // namespace shm_cc_ops
 
 std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
@@ -560,8 +754,56 @@ void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
     case 4:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
       break;
+    case 5:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 5>(ctx, data, elem_num);
+      break;
+    case 6:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 6>(ctx, data, elem_num);
+      break;
+    case 7:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 7>(ctx, data, elem_num);
+      break;
     case 8:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(ctx, data, elem_num);
+      break;
+    default:
+      TORCH_CHECK(false,
+                  "Invalid world size: " + std::to_string(ctx->group_size));
+  }
+}
+
+template <typename scalar_t>
+void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
+                            size_t elem_num, scalar_t* output,
+                            int64_t out_begin, int64_t out_end) {
+  switch (ctx->group_size) {
+    case 2:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 2>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 3:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 3>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 4:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 4>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 5:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 5>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 6:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 6>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 7:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 7>(
+          ctx, data, elem_num, output, out_begin, out_end);
+      break;
+    case 8:
+      shm_cc_ops::reduce_scatter_sum_impl<scalar_t, 8>(
+          ctx, data, elem_num, output, out_begin, out_end);
       break;
     default:
       TORCH_CHECK(false,
@@ -607,6 +849,106 @@ void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
       });
 
   return;
+}
+
+// Variable-size all-gather of several tensors along dim 0 in one SHM round.
+// Each rank streams its inputs back to back ([t0 rows | t1 rows | ...]) through
+// its SHM buffer and readers copy every rank's stream straight into that rank's
+// rows of each output, so uneven sizes need no padding or concatenation. The
+// loop runs over the longest stream so that all ranks take the same stamp steps.
+void shm_all_gatherv_impl(ThreadSHMContext* ctx,
+                          const std::vector<torch::Tensor>& inputs,
+                          const std::vector<torch::Tensor>& outputs,
+                          const std::vector<int64_t>& sizes) {
+  CPU_KERNEL_GUARD_IN(shm_all_gatherv_impl)
+  const int world_size = ctx->group_size;
+  const int64_t tensor_num = inputs.size();
+  TORCH_CHECK_EQ(sizes.size(), world_size);
+  TORCH_CHECK_EQ(outputs.size(), tensor_num);
+  TORCH_CHECK_LE(tensor_num, MAX_P2P_SEND_TENSOR_NUM);
+
+  int64_t row_offsets[MAX_SHM_RANK_NUM + 1] = {0};
+  int64_t max_rows = 0;
+  for (int r = 0; r < world_size; ++r) {
+    row_offsets[r + 1] = row_offsets[r] + sizes[r];
+    max_rows = std::max(max_rows, sizes[r]);
+  }
+  const int64_t total_rows = row_offsets[world_size];
+  if (total_rows == 0) {
+    return;
+  }
+
+  int64_t row_bytes[MAX_P2P_SEND_TENSOR_NUM];
+  const int8_t* in_ptrs[MAX_P2P_SEND_TENSOR_NUM];
+  int8_t* out_ptrs[MAX_P2P_SEND_TENSOR_NUM];
+  int64_t stream_row_bytes = 0;
+  for (int64_t j = 0; j < tensor_num; ++j) {
+    const torch::Tensor& in = inputs[j];
+    const torch::Tensor& out = outputs[j];
+    TORCH_CHECK(in.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK_EQ(in.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(out.nbytes() % total_rows, 0);
+    row_bytes[j] = out.nbytes() / total_rows;
+    TORCH_CHECK_EQ(in.nbytes(), sizes[ctx->rank] * row_bytes[j]);
+    in_ptrs[j] = reinterpret_cast<const int8_t*>(in.data_ptr());
+    out_ptrs[j] = reinterpret_cast<int8_t*>(out.data_ptr());
+    stream_row_bytes += row_bytes[j];
+  }
+
+  // Calls fn(tensor, offset in that tensor's rows of rank r, offset in the
+  // chunk, bytes) for each piece of rank r's stream within [begin, begin+len).
+  auto for_each_piece = [&](int r, int64_t begin, int64_t len, auto&& fn) {
+    int64_t seg_begin = 0;
+    for (int64_t j = 0; j < tensor_num; ++j) {
+      const int64_t seg_end = seg_begin + sizes[r] * row_bytes[j];
+      const int64_t lo = std::max(begin, seg_begin);
+      const int64_t hi = std::min(begin + len, seg_end);
+      if (lo < hi) {
+        fn(j, lo - seg_begin, lo - begin, hi - lo);
+      }
+      seg_begin = seg_end;
+    }
+  };
+
+  // std::memcpy: pieces start at arbitrary byte offsets, and the tail load of
+  // shm_cc_ops::memcpy reads a full vector past the end of the source.
+  shm_cc_ops::shm_cc_loop<int8_t>(
+      ctx, max_rows * stream_row_bytes,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num, bool fast_mode) {
+        const int rank = thread_ctx->rank;
+        int8_t* local_shm = thread_ctx->get_thread_shm_ptr<int8_t>(rank);
+
+        if (!fast_mode) {
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+        }
+
+        for_each_piece(rank, data_offset, data_elem_num,
+                       [&](int64_t j, int64_t seg_off, int64_t chunk_off,
+                           int64_t bytes) {
+                         const int8_t* src = in_ptrs[j] + seg_off;
+                         std::memcpy(local_shm + chunk_off, src, bytes);
+                         std::memcpy(out_ptrs[j] + row_offsets[rank] * row_bytes[j] +
+                                         seg_off,
+                                     src, bytes);
+                       });
+        thread_ctx->commit_ready_stamp();
+
+        for (int i = 1; i < world_size; ++i) {
+          const int src_rank = thread_ctx->get_swizzled_rank(i);
+          thread_ctx->wait_for_one(src_rank,
+                                   ThreadSHMContext::check_stamp_ready);
+          const int8_t* remote_shm =
+              thread_ctx->get_thread_shm_ptr<int8_t>(src_rank);
+          for_each_piece(
+              src_rank, data_offset, data_elem_num,
+              [&](int64_t j, int64_t seg_off, int64_t chunk_off, int64_t bytes) {
+                std::memcpy(out_ptrs[j] + row_offsets[src_rank] * row_bytes[j] +
+                                seg_off,
+                            remote_shm + chunk_off, bytes);
+              });
+        }
+      });
 }
 
 struct MemPiece {
@@ -827,6 +1169,18 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
   });
 }
 
+// inputs: this rank's [sizes[rank], ...] tensors; outputs: [sum(sizes), ...]
+// tensors receiving every rank's rows in rank order. Any dtype (bytes copy).
+void shm_all_gatherv(int64_t handle, const std::vector<torch::Tensor>& inputs,
+                     const std::vector<torch::Tensor>& outputs,
+                     const std::vector<int64_t>& sizes) {
+  CPU_KERNEL_GUARD_IN(shm_all_gatherv)
+  shm_all_gatherv_impl(
+      SHMManager::get_singleton_instance(handle)->get_shm_ctx(), inputs,
+      outputs, sizes);
+  CPU_KERNEL_GUARD_OUT(shm_all_gatherv)
+}
+
 void shm_allreduce(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
   VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
@@ -835,6 +1189,31 @@ void shm_allreduce(int64_t handle, torch::Tensor& data) {
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
+}
+
+// data: the full tensor on every rank; output: this rank's slice, starting at
+// element `out_offset` of data. Without `out_offset` the slices are equal
+// sized and ordered by rank (kept out of the schema so that compiled graphs
+// don't bake shape-derived offsets in).
+void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,
+                        torch::Tensor& output,
+                        const std::optional<int64_t> out_offset) {
+  TORCH_CHECK(data.is_contiguous())
+  TORCH_CHECK(output.is_contiguous())
+  TORCH_CHECK_EQ(data.scalar_type(), output.scalar_type());
+  auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
+  const int64_t offset = out_offset.has_value()
+                             ? out_offset.value()
+                             : ctx->rank * output.numel();
+  TORCH_CHECK(offset >= 0 && offset + output.numel() <= data.numel());
+  VLLM_DISPATCH_FLOATING_TYPES(
+      data.scalar_type(), "shm_reduce_scatter_sum", [&] {
+        CPU_KERNEL_GUARD_IN(shm_reduce_scatter_sum)
+        shm_reduce_scatter_sum(ctx, data.data_ptr<scalar_t>(), data.numel(),
+                               output.data_ptr<scalar_t>(), offset,
+                               offset + output.numel());
+        CPU_KERNEL_GUARD_OUT(shm_reduce_scatter_sum)
+      });
 }
 
 void shm_send_tensor_list(int64_t handle,

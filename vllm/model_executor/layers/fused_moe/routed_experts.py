@@ -204,6 +204,19 @@ class RoutedExperts(PluggableLayer):
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+        if (
+            self.moe_config.intermediate_size % tp_size != 0
+            and not self.moe_config.tp_shard_with_padding
+        ):
+            raise ValueError(
+                f"MoE intermediate size {self.moe_config.intermediate_size} is not "
+                f"divisible by the MoE tensor-parallel size {tp_size} (TP x DP "
+                "without expert parallelism), and "
+                f"{self.quant_method.__class__.__name__} cannot pad the TP shards. "
+                "Enable expert parallelism or use a compatible TP/DP size."
+            )
+
         self.lora_base_layer_prefix = ""
 
     # TODO(bnell): Temporary hack. Get rid of this.

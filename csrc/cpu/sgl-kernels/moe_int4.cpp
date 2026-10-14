@@ -188,15 +188,19 @@ void fused_experts_int4_w4a8_kernel_impl(
     }
   });
 
+  // ic0/ic1 rows are in sorted order, only the first `offsets[MB]` rows are
+  // routed to local experts (fewer than M * topk with expert parallel)
+  const int64_t num_local_rows = offsets[MB];
+
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
-  at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, num_local_rows, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
       silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
     }
   });
 
-  // stage 1.5: quantize ic1 to uint8, [M * topk, N]
-  at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+  // stage 1.5: quantize ic1 to uint8, [num_local_rows, N]
+  at::parallel_for(0, num_local_rows, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
       quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
@@ -283,7 +287,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   //   from [M, topk, K] to [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+      sum_stub(output + m * K, ic2 + m * topk * K, topk_weights + m * topk, topk, K);
     }
   });
 }

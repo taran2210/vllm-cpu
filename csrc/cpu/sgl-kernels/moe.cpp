@@ -44,13 +44,18 @@ int moe_align_block_size(
     int num_threads) {
 #define T_INDEX(tt) total_cnts + (tt) * num_experts
 
+  // with expert parallel, ids outside [0, num_experts) belong to other ranks
+  auto is_local = [=](int32_t expert_id) { return expert_id >= 0 && expert_id < num_experts; };
+
   // accumulate count of expert ids locally
   at::parallel_for(0, numel, 0, [&](int begin, int end) {
     int tid = at::get_thread_num();
     int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
 
     for (int i = begin; i < end; ++i) {
-      local_cnts[topk_ids[i]]++;
+      if (is_local(topk_ids[i])) {
+        local_cnts[topk_ids[i]]++;
+      }
     }
   });
 
@@ -63,8 +68,10 @@ int moe_align_block_size(
   // the last row holds sums of each experts
   int32_t* total_cnts_t_1 = T_INDEX(num_threads);
 
+  int numel_local = 0;
   cumsums[0] = 0;
   for (int e = 0; e < num_experts; ++e) {
+    numel_local += total_cnts_t_1[e];
     // accumulate `num_tokens_post_pad`, also as the expert offset
     cumsums[e + 1] = cumsums[e] + div_up(total_cnts_t_1[e], BLOCK_M) * BLOCK_M;
 
@@ -81,6 +88,9 @@ int moe_align_block_size(
 
     for (int i = begin; i < end; ++i) {
       int32_t expert_id = topk_ids[i];
+      if (!is_local(expert_id)) {
+        continue;
+      }
       int32_t b_offset = cumsums[expert_id];
       int32_t t_offset = offsets[expert_id];
       sorted_ids[b_offset + t_offset] = i;
@@ -117,8 +127,8 @@ int moe_align_block_size(
   for (int mb = 0; mb < num_token_blocks; ++mb) {
     offsets[mb + 1] += offsets[mb];
   }
-  // debug: the last value of offsets should be `numel`
-  TORCH_CHECK(offsets[num_token_blocks] == numel);
+  // debug: the last value of offsets should be the number of local entries
+  TORCH_CHECK(offsets[num_token_blocks] == numel_local);
 
   return num_tokens_post_pad;
 }
@@ -643,7 +653,7 @@ void fused_experts_kernel_impl(
   //   from [M, topk, K] to [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+      sum_stub(output + m * K, ic2 + m * topk * K, topk_weights + m * topk, topk, K);
     }
   });
 }
@@ -1015,6 +1025,12 @@ void fused_experts_cpu(
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
       sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
+  // entries routed to experts on other EP ranks are never computed, zero
+  // their weights so the final topk reduction skips them
+  if (offsets[num_tokens_post_pad / BLOCK_M] != numel) {
+    topk_weights_ = topk_weights_.masked_fill(topk_ids_.lt(0).logical_or(topk_ids_.ge(E)), 0.f);
+  }
+
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
   //   1. intermediate_cache1 : [M * topk, N]
   //   2. intermediate_cache2 : [M * topk, K]
@@ -1216,7 +1232,7 @@ void fused_experts_cpu(
           w1_scale.value().data_ptr<float>(),
           w2_scale.value().data_ptr<float>(),
           group_size,
-          topk_weights.data_ptr<float>(),
+          topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
           offsets,

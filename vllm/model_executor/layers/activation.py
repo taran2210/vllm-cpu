@@ -125,6 +125,8 @@ class SiluAndMul(CustomOp):
 
     # --8<-- [end:silu_and_mul]
 
+    _CPU_KERNEL_ARCHS = (CpuArchEnum.POWERPC, CpuArchEnum.X86)
+
     def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
         if (
@@ -132,7 +134,7 @@ class SiluAndMul(CustomOp):
             or current_platform.is_xpu()
             or (
                 current_platform.is_cpu()
-                and current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
+                and current_platform.get_cpu_architecture() in self._CPU_KERNEL_ARCHS
             )
         ):
             self.op = torch.ops._C.silu_and_mul
@@ -154,7 +156,7 @@ class SiluAndMul(CustomOp):
         return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC:
+        if current_platform.get_cpu_architecture() in self._CPU_KERNEL_ARCHS:
             return self.forward_cuda(x)
         return self.forward_native(x)
 

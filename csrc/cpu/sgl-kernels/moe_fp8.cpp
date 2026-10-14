@@ -217,7 +217,7 @@ void fused_experts_fp_kernel_impl(
   //   from [M, topk, K] to [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+      sum_stub(output + m * K, ic2 + m * topk * K, topk_weights + m * topk, topk, K);
     }
   });
 }

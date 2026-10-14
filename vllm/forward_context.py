@@ -84,6 +84,12 @@ class DPMetadata:
     # NOTE: local_sizes should only be set by the chunked_sizes context manager
     local_sizes: list[int] | None = None
 
+    # Every MoE layer of a step asks for the same SP sizes, and computing them
+    # takes several eager tensor ops, so compute them once per step.
+    _sp_local_sizes_cache: dict[tuple[int, int, bool], list[int]] = field(
+        default_factory=dict, repr=False
+    )
+
     @staticmethod
     def make(
         parallel_config: ParallelConfig,
@@ -113,9 +119,14 @@ class DPMetadata:
         """Context manager for setting self.local_sizes. Same as self.chunked_sizes
         but without any chunking.
         """
-        self.local_sizes = _compute_sp_num_tokens(
-            self.num_tokens_across_dp_cpu, sequence_parallel_size, pcp_size, use_ep
-        )
+        key = (sequence_parallel_size, pcp_size, use_ep)
+        sizes = self._sp_local_sizes_cache.get(key)
+        if sizes is None:
+            sizes = _compute_sp_num_tokens(
+                self.num_tokens_across_dp_cpu, sequence_parallel_size, pcp_size, use_ep
+            )
+            self._sp_local_sizes_cache[key] = sizes
+        self.local_sizes = sizes
         try:
             yield self.local_sizes
         finally:
